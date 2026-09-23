@@ -2,16 +2,36 @@ import os
 import time
 import logging
 import requests
+from threading import Thread
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
+
+# --- إعداد سيرفر Flask لـ UptimeRobot ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Bot is alive and running!", 200
+
+def run_flask():
+    # Render يمرر البورت تلقائياً عبر متغير البيئة PORT
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+# ------------------------------------------
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 BOT_TOKEN = "8710810061:AAFFog3scVzNKJDFPM10xl79ju0_pcgfPpQ"
-CHANNEL_ID = -1004249457655 
+CHANNEL_ID = -1004249457655
 CHANNEL_INVITE_LINK = "https://t.me/+C0nM4ztVTZpjNDdk"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -202,6 +222,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
 
 if __name__ == '__main__':
+    # تشغيل سيرفر Flask كي تستجيب الخدمة للـ Pings
+    keep_alive()
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
