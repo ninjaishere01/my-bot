@@ -36,7 +36,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
+raw_channel_id = os.environ.get("CHANNEL_ID")
+CHANNEL_ID = int(raw_channel_id) if raw_channel_id else 0
 CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
