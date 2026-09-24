@@ -7,6 +7,11 @@ from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
+from dotenv import load_dotenv
+load_dotenv()
+
+
+
 
 # --- إعداد سيرفر Flask لـ UptimeRobot ---
 web_app = Flask(__name__)
@@ -30,9 +35,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-BOT_TOKEN = "8710810061:AAFFog3scVzNKJDFPM10xl79ju0_pcgfPpQ"
-CHANNEL_ID = -1004249457655
-CHANNEL_INVITE_LINK = "https://t.me/+C0nM4ztVTZpjNDdk"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
