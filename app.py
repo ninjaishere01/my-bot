@@ -13,6 +13,7 @@ import yt_dlp
 from dotenv import load_dotenv
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -42,6 +43,10 @@ if os.path.exists(SECRET_COOKIES):
         shutil.copy(SECRET_COOKIES, COOKIES_FILE)
     except Exception as e:
         print(f"Could not copy cookies: {e}")
+
+# بروكسي اختياري (مهم لو السيرفر IP بتاعه محظور من تيك توك): http://user:pass@host:port
+PROXY_URL = os.environ.get("PROXY_URL")
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 MAX_TG_SIZE = 50 * 1024 * 1024  # حد تليجرام للبوتات
 MAX_CONCURRENT_DOWNLOADS = 2     # عدد التحميلات المتزامنة (مناسب لـ Render المجاني)
@@ -114,7 +119,7 @@ def cleanup_files(job_id: str):
 
 def save_stream(url: str, path: str, headers: dict):
     """تنزيل ملف بالـ stream من غير ما يتحمل كله في الذاكرة."""
-    with requests.get(url, headers=headers, timeout=60, stream=True) as r:
+    with requests.get(url, headers=headers, timeout=60, stream=True, proxies=PROXIES) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
@@ -129,6 +134,7 @@ def resolve_url(url: str) -> str:
             headers={"User-Agent": USER_AGENT},
             allow_redirects=True,
             timeout=10,
+            proxies=PROXIES,
         )
         return r.url.split("?")[0]
     except Exception as e:
@@ -148,7 +154,15 @@ def download_tiktok_sync(video_url: str, v_path: str, a_path: str) -> bool:
                 params={"url": full_url},
                 headers=headers,
                 timeout=15,
+                proxies=PROXIES,
             )
+            if "json" not in response.headers.get("Content-Type", ""):
+                logging.warning(
+                    f"tikwm attempt {attempt}: status={response.status_code}, "
+                    f"body={response.text[:150]!r}"
+                )
+                time.sleep(1.5)
+                continue
             res = response.json()
             if res.get("code") != 0:
                 logging.warning(f"tikwm attempt {attempt}: {res.get('msg')}")
@@ -202,6 +216,16 @@ def download_video_sync(video_url: str, job_id: str) -> str:
     }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+
+    # تقليد متصفح حقيقي (بيحتاج curl-cffi)
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        opts["impersonate"] = ImpersonateTarget("chrome")
+    except Exception:
+        pass
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
@@ -345,6 +369,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         error_text = str(e)
         if len(error_text) > 300:
             error_text = error_text[:300] + "..."
+        if "tiktok.com" in video_url:
+            error_text = "تيك توك رافض الطلب من السيرفر دلوقتي، جرّب بعد شوية أو ابعت لينك من موقع تاني."
         try:
             await msg.edit_text(f"حدث خطأ أثناء التحميل:\n{error_text}")
         except Exception:
@@ -352,6 +378,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     finally:
         cleanup_files(job_id)
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        logging.warning("Conflict: في نسخة تانية من البوت شغالة بنفس التوكن")
+        return
+    logging.error("Unhandled error", exc_info=context.error)
 
 
 async def post_init(application):
@@ -383,6 +416,7 @@ if __name__ == "__main__":
         .build()
     )
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
