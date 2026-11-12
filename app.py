@@ -57,6 +57,10 @@ USER_AGENT = (
 
 download_semaphore = None  # بيتعمل جوه الـ event loop
 
+# منع معالجة نفس الرسالة مرتين
+recent_messages = {}
+DEDUP_TTL = 300  # ثواني
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -156,6 +160,9 @@ def download_tiktok_sync(video_url: str, v_path: str, a_path: str) -> bool:
                 timeout=15,
                 proxies=PROXIES,
             )
+            if response.status_code == 403:
+                logging.warning("tikwm رفض الطلب (403) - IP السيرفر محظور، هكمل بـ yt-dlp")
+                return False
             if "json" not in response.headers.get("Content-Type", ""):
                 logging.warning(
                     f"tikwm attempt {attempt}: status={response.status_code}, "
@@ -285,6 +292,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+
+    # تجاهل الرسالة لو اتعالجت قبل كدا
+    key = (update.effective_chat.id, update.message.message_id)
+    now = time.time()
+    for k, t in list(recent_messages.items()):
+        if now - t > DEDUP_TTL:
+            recent_messages.pop(k, None)
+    if key in recent_messages:
+        logging.info(f"Duplicate update ignored: {key}")
+        return
+    recent_messages[key] = now
 
     # فحص الاشتراك الإجباري
     if not await is_subscribed(user_id, context):
@@ -420,6 +438,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🚀 The Bot is running now ..")
+    print("🚀 The Bot is running now ..", flush=True)
     app.run_polling()
+
     
