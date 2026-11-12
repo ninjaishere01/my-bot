@@ -1,40 +1,30 @@
 import os
-import time
+import glob
+import uuid
+import shutil
+import asyncio
 import logging
-import requests
+import subprocess
 from threading import Thread
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+import requests
 import yt_dlp
 from dotenv import load_dotenv
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+
 load_dotenv()
 
-
-
-
-# --- إعداد سيرفر Flask لـ UptimeRobot ---
-web_app = Flask(__name__)
-
-@web_app.route('/')
-def home():
-    return "Bot is alive and running!", 200
-
-def run_flask():
-    # Render يمرر البورت تلقائياً عبر متغير البيئة PORT
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-# ------------------------------------------
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-
+# ------------------------------------------------------------------
+# الإعدادات
+# ------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 raw_channel_id = os.environ.get("CHANNEL_ID", "0")
 try:
@@ -44,206 +34,332 @@ except ValueError:
 
 CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK", "")
 
+raw_channel_id = os.environ.get("CHANNEL_ID")
+CHANNEL_ID = int(raw_channel_id) if raw_channel_id else 0
+CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "bot_downloads")
+COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
+
+MAX_TG_SIZE = 50 * 1024 * 1024  # حد تليجرام للبوتات
+MAX_CONCURRENT_DOWNLOADS = 2     # عدد التحميلات المتزامنة (مناسب لـ Render المجاني)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+download_semaphore = None  # بيتعمل جوه الـ event loop
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+# ------------------------------------------------------------------
+# سيرفر Flask لـ UptimeRobot
+# ------------------------------------------------------------------
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "Bot is alive and running!", 200
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
+
+def keep_alive():
+    t = Thread(target=run_flask, daemon=True)
+    t.start()
+
+
+# ------------------------------------------------------------------
+# دوال مساعدة
+# ------------------------------------------------------------------
+def subscribe_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📢 انضم للقناة الآن", url=CHANNEL_INVITE_LINK)]]
+    )
+
 
 async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        return member.status in ['member', 'administrator', 'creator']
+        if member.status in ("member", "administrator", "creator"):
+            return True
+        if member.status == "restricted" and getattr(member, "is_member", False):
+            return True
+        return False
     except Exception as e:
         logging.error(f"Error checking channel membership: {e}")
         return False
 
+
+def cleanup_files(job_id: str):
+    """مسح كل الملفات المؤقتة الخاصة بالعملية دي."""
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def download_tiktok_sync(video_url: str, v_path: str, a_path: str) -> bool:
+    """تحميل من تيك توك عبر tikwm API. بترجع True لو نجح."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    try:
+        response = requests.get(
+            "https://www.tikwm.com/api/",
+            params={"url": video_url},
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return False
+        res = response.json()
+        if res.get("code") != 0:
+            return False
+
+        data = res.get("data", {})
+        play_url = data.get("play")
+        if not play_url:
+            return False
+
+        with requests.get(play_url, headers=headers, timeout=60, stream=True) as r:
+            r.raise_for_status()
+            with open(v_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
+
+        music_url = data.get("music")
+        if music_url:
+            try:
+                with requests.get(music_url, headers=headers, timeout=60, stream=True) as r:
+                    r.raise_for_status()
+                    with open(a_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 256):
+                            f.write(chunk)
+            except Exception as e:
+                logging.warning(f"TikTok audio download failed: {e}")
+
+        return os.path.exists(v_path) and os.path.getsize(v_path) > 0
+    except Exception as e:
+        logging.warning(f"TikTok API failed, shifting to yt-dlp: {e}")
+        return False
+
+
+def download_video_sync(video_url: str, job_id: str) -> str:
+    """تحميل الفيديو بـ yt-dlp وبترجع مسار الملف."""
+    if "youtube.com" in video_url or "youtu.be" in video_url:
+        # نفضّل ملف مدمج mp4 تحت 50MB، وبعدين جودة 480 كحد أقصى
+        format_setting = (
+            "best[ext=mp4][filesize<50M]/"
+            "best[ext=mp4][height<=480]/"
+            "best[height<=480]/best"
+        )
+    else:
+        format_setting = "best"
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "noplaylist": True,
+        "user_agent": USER_AGENT,
+        "format": format_setting,
+        "outtmpl": os.path.join(DOWNLOAD_DIR, f"{job_id}_video.%(ext)s"),
+        "merge_output_format": "mp4",
+    }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        v_path = None
+        downloads = info.get("requested_downloads") if isinstance(info, dict) else None
+        if downloads:
+            v_path = downloads[0].get("filepath")
+        if not v_path:
+            v_path = ydl.prepare_filename(info)
+
+    base = os.path.splitext(v_path)[0]
+    if not os.path.exists(v_path) and os.path.exists(base + ".mp4"):
+        v_path = base + ".mp4"
+    return v_path
+
+
+def extract_audio_sync(v_path: str, a_path: str) -> bool:
+    """استخراج الصوت من الفيديو اللي نزل بدل تحميله مرة تانية."""
+    if not shutil.which("ffmpeg"):
+        logging.warning("ffmpeg not found, skipping audio extraction")
+        return False
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", v_path,
+                "-vn", "-acodec", "libmp3lame", "-b:a", "192k",
+                a_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=180,
+            check=True,
+        )
+        return os.path.exists(a_path) and os.path.getsize(a_path) > 0
+    except Exception as e:
+        logging.warning(f"Audio extraction failed: {e}")
+        return False
+
+
+# ------------------------------------------------------------------
+# الهاندلرز
+# ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await is_subscribed(user_id, context):
-        keyboard = [
-            [InlineKeyboardButton("📢 انضم للقناة الآن", url=CHANNEL_INVITE_LINK)],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            "⚠️ من فضلك انضم للقناه اولاً  \n\n اشترك هنا وابعت للينك الفديو تاني",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
+            "⚠️ من فضلك انضم للقناه اولاً\n\nاشترك هنا وابعت لينك الفيديو تاني",
+            reply_markup=subscribe_keyboard(),
         )
         return
 
-    await update.message.reply_text(
-        " ابعت للينك الفديو اللي حابب تنزلو 🎬"
-    )
+    await update.message.reply_text("ابعت لينك الفيديو اللي حابب تنزلو 🎬")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     user_id = update.effective_user.id
-    
+
     # فحص الاشتراك الإجباري
     if not await is_subscribed(user_id, context):
-        keyboard = [
-            [InlineKeyboardButton("📢 انضم للقناة الآن", url=CHANNEL_INVITE_LINK)],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            " \n  اشترك في القناه بس عشان تستخدم البوت براحتك 💖",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
+            "اشترك في القناه بس عشان تستخدم البوت براحتك 💖",
+            reply_markup=subscribe_keyboard(),
         )
         return
 
     video_url = update.message.text.strip()
-    
     if not (video_url.startswith("http://") or video_url.startswith("https://")):
         await update.message.reply_text("يرجى إرسال رابط صحيح.")
         return
 
     msg = await update.message.reply_text("جاري معالجة الرابط والتحميل... ⏳")
-    
-    timestamp = int(time.time())
-    download_path = os.path.join(BASE_DIR, "bot_downloads")
-    os.makedirs(download_path, exist_ok=True)
 
-    v_path = ""
-    a_path = ""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    job_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+    v_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_video.mp4")
+    a_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_audio.mp3")
 
     try:
-        tiktok_success = False
+        async with download_semaphore:
+            tiktok_success = False
 
-        # 1. محاولة التحميل من تيك توك عبر الـ API أولاً
-        if 'tiktok.com' in video_url:
-            try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'application/json'
-                }
-                api_url = f"https://www.tikwm.com/api/?url={video_url}"
-                response = requests.get(api_url, headers=headers, timeout=15)
-                
-                # التأكد من أن الاستجابة جاءت بصيغة JSON فعلياً
-                if response.status_code == 200 and 'application/json' in response.headers.get('Content-Type', ''):
-                    res = response.json()
-                    if res.get("code") == 0:
-                        data = res.get("data", {})
-                        v_path = os.path.join(download_path, f"{timestamp}_video.mp4")
-                        a_path = os.path.join(download_path, f"{timestamp}_audio.mp3")
-
-                        video_bytes = requests.get(data.get("play"), headers=headers, timeout=60).content
-                        with open(v_path, 'wb') as f:
-                            f.write(video_bytes)
-
-                        music_url = data.get("music")
-                        if music_url:
-                            audio_bytes = requests.get(music_url, headers=headers, timeout=60).content
-                            with open(a_path, 'wb') as f:
-                                f.write(audio_bytes)
-
-                        tiktok_success = True
-            except Exception as e:
-                logging.warning(f"TikTok API failed, shifting to yt-dlp: {e}")
-
-        # 2. التحميل لجميع المواقع (أو التيك توك في حال فشل الـ API)
-        if not tiktok_success:
-            cookies_file = os.path.join(BASE_DIR, 'cookies.txt')
-            common_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            }
-            if os.path.exists(cookies_file):
-                common_opts['cookiefile'] = cookies_file
-
-            if 'youtube.com' in video_url or 'youtu.be' in video_url:
-                format_setting = 'bestvideo+bestaudio/best'
-            else:
-                format_setting = 'best'
-
-            ydl_opts_video = {
-                **common_opts,
-                'format': format_setting,
-                'outtmpl': f'{download_path}/{timestamp}_video.%(ext)s',
-                'merge_output_format': 'mp4',
-            }
-
-            ydl_opts_audio = {
-                **common_opts,
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': f'{download_path}/{timestamp}_audio.%(ext)s',
-            }
-
-            # تنزيل الفيديو
-            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-                info_v = ydl.extract_info(video_url, download=True)
-                v_path = ydl.prepare_filename(info_v)
-                
-                base_filepath = os.path.splitext(v_path)[0]
-                if os.path.exists(f"{base_filepath}.mp4"):
-                    v_path = f"{base_filepath}.mp4"
-
-            # تنزيل الصوت منفصلاً
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
-                    info_a = ydl.extract_info(video_url, download=True)
-                    raw_a = ydl.prepare_filename(info_a)
-                    a_path = raw_a.rsplit('.', 1)[0] + '.mp3'
-            except Exception as audio_err:
-                logging.warning(f"Could not extract audio separately: {audio_err}")
-
-        # إرسال الفيديو للمستخدم
-        if v_path and os.path.exists(v_path):
-            with open(v_path, 'rb') as vf:
-                await update.message.reply_video(
-                    video=vf, 
-                    caption="تم تحميل الفيديو بنجاح 🎉",
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=120
+            # 1. تيك توك عبر الـ API أولاً
+            if "tiktok.com" in video_url:
+                tiktok_success = await asyncio.to_thread(
+                    download_tiktok_sync, video_url, v_path, a_path
                 )
-        await update.message.reply_text(" متنساش تصلي ع النبي , وتدعي لأبويا بالرحمه 💖 ")
 
-        # إرسال الصوت للمستخدم
-        if a_path and os.path.exists(a_path):
-            with open(a_path, 'rb') as af:
-                await update.message.reply_audio(
-                    audio=af, 
-                    caption="🎵 موسيقي الفديو MP3",
+            # 2. باقي المواقع (أو تيك توك لو الـ API فشل)
+            if not tiktok_success:
+                v_path = await asyncio.to_thread(download_video_sync, video_url, job_id)
+                # الصوت بيتستخرج من الفيديو اللي نزل
+                await asyncio.to_thread(extract_audio_sync, v_path, a_path)
+
+        has_video = bool(v_path) and os.path.exists(v_path)
+        has_audio = os.path.exists(a_path) and os.path.getsize(a_path) > 0
+
+        if not has_video:
+            await msg.edit_text("مقدرتش أحمل الفيديو من الرابط ده 😕")
+            return
+
+        # فحص الحجم قبل الإرسال
+        video_too_big = os.path.getsize(v_path) > MAX_TG_SIZE
+        audio_too_big = has_audio and os.path.getsize(a_path) > MAX_TG_SIZE
+
+        if video_too_big:
+            await update.message.reply_text(
+                "الفيديو أكبر من 50MB وتليجرام مبيسمحش للبوتات بالحجم ده 😕"
+            )
+        else:
+            with open(v_path, "rb") as vf:
+                await update.message.reply_video(
+                    video=vf,
+                    caption="تم تحميل الفيديو بنجاح 🎉",
+                    supports_streaming=True,
                     read_timeout=120,
                     write_timeout=120,
-                    connect_timeout=120
+                    connect_timeout=120,
+                )
+            await update.message.reply_text("متنساش تصلي ع النبي , وتدعي لأبويا بالرحمه 💖")
+
+        if has_audio and not audio_too_big:
+            with open(a_path, "rb") as af:
+                await update.message.reply_audio(
+                    audio=af,
+                    caption="🎵 موسيقى الفيديو MP3",
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=120,
                 )
 
         try:
             await msg.delete()
-        except:
+        except Exception:
             pass
 
     except Exception as e:
-        await msg.edit_text(f"حدث خطأ أثناء التحميل: {str(e)}")
+        logging.error(f"Download error: {e}")
+        error_text = str(e)
+        if len(error_text) > 300:
+            error_text = error_text[:300] + "..."
+        try:
+            await msg.edit_text(f"حدث خطأ أثناء التحميل: {error_text}")
+        except Exception:
+            pass
 
     finally:
-        # مسح الملفات المؤقتة
-        if v_path and os.path.exists(v_path):
-            try: os.remove(v_path)
-            except: pass
-        if a_path and os.path.exists(a_path):
-            try: os.remove(a_path)
-            except: pass
+        cleanup_files(job_id)
 
-if __name__ == '__main__':
-    # تشغيل سيرفر Flask كي تستجيب الخدمة للـ Pings
+
+async def post_init(application):
+    global download_semaphore
+    download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+
+# ------------------------------------------------------------------
+# التشغيل
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise SystemExit("❌ BOT_TOKEN مش موجود في متغيرات البيئة")
+    if not CHANNEL_ID:
+        raise SystemExit("❌ CHANNEL_ID مش موجود أو غلط في متغيرات البيئة")
+    if not CHANNEL_INVITE_LINK:
+        raise SystemExit("❌ CHANNEL_INVITE_LINK مش موجود في متغيرات البيئة")
+
     keep_alive()
 
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
         .write_timeout(120)
         .read_timeout(120)
         .connect_timeout(120)
         .build()
     )
-    
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
