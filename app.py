@@ -1,5 +1,6 @@
 import os
 import glob
+import time
 import uuid
 import shutil
 import asyncio
@@ -26,21 +27,21 @@ load_dotenv()
 # الإعدادات
 # ------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-raw_channel_id = os.environ.get("CHANNEL_ID", "0")
-try:
-    CHANNEL_ID = int(str(raw_channel_id).strip())
-except ValueError:
-    CHANNEL_ID = 0
-
-CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK", "")
-
 raw_channel_id = os.environ.get("CHANNEL_ID")
 CHANNEL_ID = int(raw_channel_id) if raw_channel_id else 0
 CHANNEL_INVITE_LINK = os.environ.get("CHANNEL_INVITE_LINK")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "bot_downloads")
+
+# الكوكيز: لو مرفوعة على Render كـ Secret File بتتنسخ لمكان قابل للكتابة
+SECRET_COOKIES = "/etc/secrets/cookies.txt"
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
+if os.path.exists(SECRET_COOKIES):
+    try:
+        shutil.copy(SECRET_COOKIES, COOKIES_FILE)
+    except Exception as e:
+        print(f"Could not copy cookies: {e}")
 
 MAX_TG_SIZE = 50 * 1024 * 1024  # حد تليجرام للبوتات
 MAX_CONCURRENT_DOWNLOADS = 2     # عدد التحميلات المتزامنة (مناسب لـ Render المجاني)
@@ -111,48 +112,70 @@ def cleanup_files(job_id: str):
             pass
 
 
-def download_tiktok_sync(video_url: str, v_path: str, a_path: str) -> bool:
-    """تحميل من تيك توك عبر tikwm API. بترجع True لو نجح."""
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+def save_stream(url: str, path: str, headers: dict):
+    """تنزيل ملف بالـ stream من غير ما يتحمل كله في الذاكرة."""
+    with requests.get(url, headers=headers, timeout=60, stream=True) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                f.write(chunk)
+
+
+def resolve_url(url: str) -> str:
+    """فك اللينكات القصيرة زي vt.tiktok.com."""
     try:
-        response = requests.get(
-            "https://www.tikwm.com/api/",
-            params={"url": video_url},
-            headers=headers,
-            timeout=15,
+        r = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            allow_redirects=True,
+            timeout=10,
         )
-        if response.status_code != 200:
-            return False
-        res = response.json()
-        if res.get("code") != 0:
-            return False
-
-        data = res.get("data", {})
-        play_url = data.get("play")
-        if not play_url:
-            return False
-
-        with requests.get(play_url, headers=headers, timeout=60, stream=True) as r:
-            r.raise_for_status()
-            with open(v_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 256):
-                    f.write(chunk)
-
-        music_url = data.get("music")
-        if music_url:
-            try:
-                with requests.get(music_url, headers=headers, timeout=60, stream=True) as r:
-                    r.raise_for_status()
-                    with open(a_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 256):
-                            f.write(chunk)
-            except Exception as e:
-                logging.warning(f"TikTok audio download failed: {e}")
-
-        return os.path.exists(v_path) and os.path.getsize(v_path) > 0
+        return r.url.split("?")[0]
     except Exception as e:
-        logging.warning(f"TikTok API failed, shifting to yt-dlp: {e}")
-        return False
+        logging.warning(f"resolve_url failed: {e}")
+        return url
+
+
+def download_tiktok_sync(video_url: str, v_path: str, a_path: str) -> bool:
+    """تحميل من تيك توك عبر tikwm API (3 محاولات). بترجع True لو نجح."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    full_url = resolve_url(video_url)
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(
+                "https://www.tikwm.com/api/",
+                params={"url": full_url},
+                headers=headers,
+                timeout=15,
+            )
+            res = response.json()
+            if res.get("code") != 0:
+                logging.warning(f"tikwm attempt {attempt}: {res.get('msg')}")
+                time.sleep(1.5)
+                continue
+
+            data = res.get("data", {})
+            play_url = data.get("play")
+            if not play_url:
+                logging.warning(f"tikwm attempt {attempt}: no play url")
+                return False
+
+            save_stream(play_url, v_path, headers)
+
+            music_url = data.get("music")
+            if music_url:
+                try:
+                    save_stream(music_url, a_path, headers)
+                except Exception as e:
+                    logging.warning(f"TikTok audio download failed: {e}")
+
+            return os.path.exists(v_path) and os.path.getsize(v_path) > 0
+        except Exception as e:
+            logging.warning(f"tikwm attempt {attempt} failed: {e}")
+            time.sleep(1.5)
+
+    return False
 
 
 def download_video_sync(video_url: str, job_id: str) -> str:
@@ -263,7 +286,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with download_semaphore:
             tiktok_success = False
 
-            # 1. تيك توك عبر الـ API أولاً
+            # 1. تيك توك عبر الـ API أولاً (بيشمل اللينكات القصيرة vt/vm)
             if "tiktok.com" in video_url:
                 tiktok_success = await asyncio.to_thread(
                     download_tiktok_sync, video_url, v_path, a_path
@@ -318,12 +341,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     except Exception as e:
-        logging.error(f"Download error: {e}")
+        logging.error(f"Download error for {video_url}: {e}")
         error_text = str(e)
         if len(error_text) > 300:
             error_text = error_text[:300] + "..."
         try:
-            await msg.edit_text(f"حدث خطأ أثناء التحميل: {error_text}")
+            await msg.edit_text(f"حدث خطأ أثناء التحميل:\n{error_text}")
         except Exception:
             pass
 
@@ -365,3 +388,4 @@ if __name__ == "__main__":
 
     print("🚀 The Bot is running now ..")
     app.run_polling()
+    

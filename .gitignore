@@ -1,10 +1,11 @@
-*.exe
-ffmpeg.exe
-ffprobe.exe
+# أسرار
 .env
-<<<<<<< HEAD
-__pycache__/
-bot_downloads/
-=======
 cookies.txt
->>>>>>> cb58301 (Update all APIs to use initData)
+
+# ملفات مؤقتة
+bot_downloads/
+__pycache__/
+*.pyc
+
+# أدوات
+*.exe
